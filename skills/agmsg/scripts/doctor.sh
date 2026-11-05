@@ -1,0 +1,1098 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# doctor.sh — "who holds what" in one screen. #267/#605.
+#
+# Usage: doctor.sh [--project <path>] [--type <type>] [--team <team>] [--redacted]
+#        doctor.sh --fix [--yes]
+#        doctor.sh --help
+#
+# Default (no filters): the whole installation -- every team, every project,
+# every type. --project / --type / --team narrow it and combine freely. This
+# matches how claude/codex/brew/flutter doctor all behave (no scope argument,
+# default to everything) rather than requiring a cross-section up front --
+# Made explicit here because the earlier <project> <type>-required
+# form had it backwards: a reporter who doesn't already know which project/type
+# to name can't use a doctor that demands one. Positional <project> <type> is
+# not kept for compatibility -- it was judged not worth carrying (see PR/report
+# history for round 2), and a stale positional form alongside flags that mean
+# something different by default would be its own source of confusion.
+#
+# Argument parsing is kept separate from scope-building (the SCOPE loop
+# below) so that a future change to what the flags are doesn't have to touch
+# how a scope, once decided, gets turned into (project, type) pairs.
+#
+# Read-only without --fix: never claims, releases, or removes a lock, pidfile,
+# or registration. A stale lock or dead pidfile is reported, not cleaned up --
+# #605's reporter was asked not to remove a lock by hand because it erases
+# the evidence; a doctor that cleaned up on its own would do the same thing to
+# itself. --fix (#1507) is the one way it changes anything, only when asked for
+# by name: it repairs what doctor found that is safe to repair, shows what it
+# will do, and asks once before touching anything (--yes skips only that
+# question). Today that is orphaned run/ records; anything doctor learns to
+# repair later belongs behind the same flag. It is NOT scripts/fix.sh (/agmsg
+# fix), which is a seat repairing its own identity.
+#
+# Data sources are the existing helpers this project already has for each
+# fact -- identities.sh for registrations, actas-lock.sh/instance-id.sh for
+# lock ownership and liveness, delivery.sh for mode and watcher/bridge
+# status, agmsg_registered_projects for cross-project/cross-type discovery.
+# Nothing here recomputes a verdict those already reach; #605's diagnostic
+# duplicated agmsg_instance_alive once and that duplication was exactly
+# what review pushed back on.
+#
+# Exit codes:
+#   0  no warnings
+#   1  one or more warnings (see WARNINGS section)
+#   2  usage or resolution error
+
+_usage() {
+  echo "Usage: doctor.sh [--project <path>] [--type <type>] [--team <team>] [--redacted]" >&2
+  echo "       doctor.sh --fix [--yes]   repair what doctor found that is safe to repair" >&2
+  echo "                                 (today: orphaned run/ records). Not scripts/fix.sh," >&2
+  echo "                                 which is a seat repairing its own identity." >&2
+  echo "       doctor.sh --help" >&2
+}
+
+# Scanned for --help before anything else is parsed, same reasoning as
+# before: a validation error on some other flag must never suppress --help.
+for _arg in "${@:-}"; do
+  case "$_arg" in
+    -h|--help) _usage; exit 0 ;;
+  esac
+done
+unset _arg
+
+# --- argument parsing: produces FILTER_PROJECT / FILTER_TYPE / FILTER_TEAM /
+#     REDACTED only. Deliberately does not decide what a scope IS -- that is
+#     entirely the SCOPE-building block below, so a future flag change stays
+#     a parsing-only change. No positional arguments are accepted -- any
+#     bare token is a usage error. -----------------------------------------
+REDACTED=0
+FIX=0 ASSUME_YES=0
+FILTER_PROJECT="" FILTER_TYPE="" FILTER_TEAM=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --project)
+      case "${2:-}" in ''|-*) echo "doctor: --project requires a value" >&2; exit 2 ;; esac
+      FILTER_PROJECT="$2"; shift 2 ;;
+    --type)
+      case "${2:-}" in ''|-*) echo "doctor: --type requires a value" >&2; exit 2 ;; esac
+      FILTER_TYPE="$2"; shift 2 ;;
+    --team)
+      case "${2:-}" in ''|-*) echo "doctor: --team requires a value" >&2; exit 2 ;; esac
+      FILTER_TEAM="$2"; shift 2 ;;
+    --redacted) REDACTED=1; shift ;;
+    --fix) FIX=1; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    -*) echo "doctor: unknown option: $1" >&2; exit 2 ;;
+    *) echo "doctor: unexpected argument: '$1' (doctor takes flags only -- see --help)" >&2; exit 2 ;;
+  esac
+done
+
+if [ "$ASSUME_YES" = 1 ] && [ "$FIX" != 1 ]; then
+  echo "doctor: --yes only applies to --fix" >&2
+  exit 2
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+RUN_DIR="$SKILL_DIR/run"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/resolve-project.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/actas-lock.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/type-registry.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/validate.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/stale-outcome-files.sh"
+
+# --- orphaned run/ records (#1507) -----------------------------------------
+#
+# Per-seat records in run/ (actas.<t>__<a>.session, ready.<t>__<a>,
+# spawn.<t>__<a>, role-session.<t>__<a>) outlive their team when the team is
+# renamed away, deleted, or was never a team at all (a project path passed as
+# the team name). One that claims a pane keeps refusing every live seat that
+# tries to take it, and nothing else ever looks at it again.
+#
+# The team a record belongs to is judged from the FILE NAME, never by cutting
+# it at "__" and trusting the cut: "__" is legal inside a name (#1023), so
+# "a___b" is both team "a_" / agent "b" and team "a" / agent "_b". A record is
+# an orphan only when NO possible cut names an existing team ("provably gone");
+# it is attributed to one seat only when there is exactly one possible cut and
+# decoding it and encoding it back reproduces the file name. Everything else is
+# reported as ambiguous and left alone. Id-keyed records (both halves UUIDs,
+# #1240) name a team by id, which this scan does not resolve, so it skips them.
+#
+# codex-bridge.<team>.<name>.* is not scanned: it spells raw names joined by
+# dots, so no name can be recovered from it with certainty.
+_DOCTOR_UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+_DOCTOR_US=$'\037'
+
+# One line per existing team (config.json present, the same test --team uses),
+# spelled the way it appears in a record's file name.
+_doctor_existing_enc_teams() {
+  local d name
+  for d in "$SKILL_DIR"/teams/*/; do
+    [ -f "${d}config.json" ] || continue
+    name="${d%/}"; name="${name##*/}"
+    _actas_lock_encode "$name"
+    printf '\n'
+  done
+}
+
+# Every way to cut <suffix> at a "__" (overlapping cuts included), both halves
+# non-empty: "<team half>\t<agent half>" per line.
+_doctor_splits() {   # <suffix>
+  awk -v s="$1" 'BEGIN { for (i = 2; i + 2 <= length(s); i++) if (substr(s, i, 2) == "__") print substr(s, 1, i - 1) "\t" substr(s, i + 2) }'
+}
+
+# The inverse of _actas_lock_encode (bytes as %XX). Lowercase hex is accepted
+# here and rejected by the caller's re-encode check.
+_doctor_decode_name() {
+  printf '%s' "$1" | LC_ALL=C awk '
+    BEGIN { for (n = 0; n < 256; n++) chr[sprintf("%02X", n)] = sprintf("%c", n) }
+    {
+      out = ""; i = 1; len = length($0)
+      while (i <= len) {
+        c = substr($0, i, 1)
+        h = toupper(substr($0, i + 1, 2))
+        if (c == "%" && i + 2 <= len && (h in chr)) { out = out chr[h]; i += 3 }
+        else { out = out c; i++ }
+      }
+      printf "%s", out
+    }'
+}
+
+# The pane a seat's records claim: spawn.<suffix>'s first field, else the mark
+# role-session.<suffix> keeps. Empty when neither names one.
+_doctor_record_pane() {   # <suffix>
+  local first="" f="$RUN_DIR/spawn.$1"
+  if [ -f "$f" ]; then
+    IFS=$'\t' read -r first _ < "$f" 2>/dev/null || true
+  fi
+  if [ -z "$first" ] && [ -f "$RUN_DIR/role-session.$1" ]; then
+    first="$(sed -n 's/^named_ref=//p' "$RUN_DIR/role-session.$1" 2>/dev/null | head -1)"
+  fi
+  case "$first" in *[[:cntrl:]]*) first="?" ;; esac
+  printf '%s' "$first"
+}
+
+# The "<enc_team>__<enc_agent>" part of every per-seat record name in run/, one
+# per line (duplicates across families are fine). A function of its own rather
+# than a loop inside $(...): bash 3.2, the macOS /bin/bash, cannot parse a case
+# statement inside a command substitution.
+_doctor_run_suffixes() {
+  local f s
+  for f in "$RUN_DIR"/actas.*.session "$RUN_DIR"/ready.* "$RUN_DIR"/spawn.* "$RUN_DIR"/role-session.*; do
+    [ -f "$f" ] || continue
+    f="${f##*/}"
+    case "$f" in
+      actas.*.session) s="${f#actas.}"; s="${s%.session}" ;;
+      ready.*) s="${f#ready.}" ;;
+      spawn.*) s="${f#spawn.}" ;;
+      role-session.*) s="${f#role-session.}" ;;
+      *) continue ;;
+    esac
+    printf '%s\n' "$s"
+  done
+}
+
+# Fills ORPHAN_SEATS ("<suffix>US<team>US<agent>US<pane>US<files>" per line) and
+# ORPHAN_AMBIGUOUS ("<suffix>US<files>" per line). US (0x1f) rather than a tab:
+# an empty pane field would collapse under a whitespace IFS.
+ORPHAN_SEATS="" ORPHAN_AMBIGUOUS=""
+_doctor_scan_orphan_run_records() {
+  local existing suffixes f s fam files splits n live id_keyed t a st sa team agent pane
+  ORPHAN_SEATS=""; ORPHAN_AMBIGUOUS=""
+  [ -d "$RUN_DIR" ] || return 0
+  existing="$(_doctor_existing_enc_teams)"
+  suffixes="$(_doctor_run_suffixes | LC_ALL=C sort -u)"
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    splits="$(_doctor_splits "$s")"
+    [ -n "$splits" ] || continue            # no "__": not a per-seat record
+    live=0; id_keyed=0; n=0
+    while IFS=$'\t' read -r t a; do
+      [ -n "$t" ] || continue
+      n=$((n + 1))
+      if [[ "$t" =~ $_DOCTOR_UUID_RE && "$a" =~ $_DOCTOR_UUID_RE ]]; then id_keyed=1; fi
+      case $'\n'"$existing"$'\n' in *$'\n'"$t"$'\n'*) live=1 ;; esac
+    done <<EOF
+$splits
+EOF
+    [ "$id_keyed" -eq 0 ] || continue
+    [ "$live" -eq 0 ] || continue           # some cut names a team that exists
+    files=""
+    for fam in actas ready spawn role-session; do
+      case "$fam" in actas) f="actas.$s.session" ;; *) f="$fam.$s" ;; esac
+      if [ -f "$RUN_DIR/$f" ]; then files="${files:+$files }$f"; fi
+    done
+    if [ "$n" -eq 1 ]; then
+      st="${splits%%$'\t'*}"; sa="${splits#*$'\t'}"
+      team="$(_doctor_decode_name "$st")"; agent="$(_doctor_decode_name "$sa")"
+      if [ -n "$team" ] && [ -n "$agent" ] \
+         && [ "$(_actas_lock_encode "$team")__$(_actas_lock_encode "$agent")" = "$s" ]; then
+        case "$team$agent" in
+          *[[:cntrl:]]*) ;;                 # cannot be shown or listed safely
+          *)
+            pane="$(_doctor_record_pane "$s")"
+            ORPHAN_SEATS="${ORPHAN_SEATS}${s}${_DOCTOR_US}${team}${_DOCTOR_US}${agent}${_DOCTOR_US}${pane}${_DOCTOR_US}${files}"$'\n'
+            continue ;;
+        esac
+      fi
+    fi
+    ORPHAN_AMBIGUOUS="${ORPHAN_AMBIGUOUS}${s}${_DOCTOR_US}${files}"$'\n'
+  done <<< "$suffixes"
+}
+
+# Under --redacted the team/agent/pane and the encoded file names (which spell
+# the team) are replaced; only record families are shown. Never used in
+# --fix mode, which is not for pasting (REDACTED is 0
+# there, so the pseudonym helpers defined further down are never reached).
+_doctor_print_orphans() {
+  local n s team agent pane files f fams
+  if [ -n "$ORPHAN_SEATS" ]; then
+    n="$(printf '%s' "$ORPHAN_SEATS" | grep -c . || true)"
+    echo "orphaned run/ records -- the team no longer exists ($n seat(s)):"
+    while IFS="$_DOCTOR_US" read -r s team agent pane files; do
+      [ -n "$s" ] || continue
+      if [ "$REDACTED" = 1 ]; then
+        _redact_team "$team"; team="$_REDACT_OUT"
+        _redact_agent "$agent"; agent="$_REDACT_OUT"
+        [ -z "$pane" ] || pane="(redacted)"
+        fams=""; for f in $files; do fams="${fams:+$fams }${f%%.*}"; done
+        files="$fams"
+      fi
+      echo "  team: $team  agent: $agent  pane: ${pane:-(none recorded)}"
+      echo "    records: $files"
+    done <<< "$ORPHAN_SEATS"
+    echo
+  fi
+  if [ -n "$ORPHAN_AMBIGUOUS" ]; then
+    n="$(printf '%s' "$ORPHAN_AMBIGUOUS" | grep -c . || true)"
+    echo "run/ records for a team that no longer exists, but not attributable to one seat (\"__\" inside a name) -- left alone ($n):"
+    while IFS="$_DOCTOR_US" read -r s files; do
+      [ -n "$s" ] || continue
+      if [ "$REDACTED" = 1 ]; then
+        fams=""; for f in $files; do fams="${fams:+$fams }${f%%.*}"; done
+        files="$fams"
+      fi
+      echo "  $files"
+    done <<< "$ORPHAN_AMBIGUOUS"
+    echo
+  fi
+}
+
+# --- registry locks with no holder record (#865) ---------------------------
+#
+# A registry lock (teams/<team>/.config.lock) names its holder in a record
+# beside it. The next command that needs the lock breaks one whose holder is
+# gone, but a lock with NO record cannot be told from one taken a moment ago
+# whose owner has not written the record yet, so nothing breaks it and every
+# command for that team then waits out its budget and fails.
+#
+# REPORTED, NEVER REMOVED, not even by --fix. Removing one safely needs the
+# acquiring side to cooperate: whatever this checks about the directory can stop
+# being true before the `rmdir` runs (the lock is released, a new owner takes
+# the same path and has not recorded itself yet), and no age or second look
+# closes that. So doctor finds them and prints the command; running it is the
+# operator's call, when every agmsg sync and seat is stopped.
+# Installation-wide, like the orphaned records above.
+LOCKS_NO_RECORD=""
+
+# Only the holder file is a record. The copy a killed release leaves behind
+# (`<lock>.holder.releasing.<pid>`) is not tied to the directory that is there
+# now, so it is not counted; a lock with only that is listed like any other.
+_doctor_lock_has_record() {   # <lock dir>
+  [ -f "$1.holder" ]
+}
+
+# Fills LOCKS_NO_RECORD with one team directory name per line. The three globs
+# are the ones remote.sh doctor uses: `*` skips a leading dot, so `.foo` and
+# `..foo` need their own.
+_doctor_scan_record_less_locks() {
+  local lock name
+  LOCKS_NO_RECORD=""
+  for lock in "$SKILL_DIR"/teams/*/.config.lock "$SKILL_DIR"/teams/.[!.]*/.config.lock "$SKILL_DIR"/teams/..?*/.config.lock; do
+    [ -d "$lock" ] || continue
+    if _doctor_lock_has_record "$lock"; then continue; fi
+    name="${lock%/.config.lock}"; name="${name##*/}"
+    LOCKS_NO_RECORD="${LOCKS_NO_RECORD}${name}"$'\n'
+  done
+}
+
+# Under --redacted the team name (and the path in the command) is replaced.
+_doctor_print_locks() {
+  local n name q
+  [ -n "$LOCKS_NO_RECORD" ] || return 0
+  n="$(printf '%s' "$LOCKS_NO_RECORD" | grep -c . || true)"
+  echo "registry locks with no holder record -- nothing can tell whether they are held ($n):"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if [ "$REDACTED" = 1 ]; then
+      _redact_team "$name"; echo "  team: $_REDACT_OUT"
+    else
+      # QUOTED, because this line is meant to be pasted: the store root and the
+      # team name can both contain a space. `rmdir`, not `rm -r`, so the paste
+      # cannot remove anything but an empty lock directory.
+      q="$(printf "'%s'" "$(printf '%s' "$SKILL_DIR/teams/$name/.config.lock" | sed "s/'/'\\\\''/g")")"
+      echo "  team: $name"
+      echo "    rmdir $q"
+    fi
+  done <<< "$LOCKS_NO_RECORD"
+  echo "  run a rmdir only when every agmsg sync and seat is stopped; a lock taken a moment ago looks the same."
+  echo
+}
+
+# --- leaked storage sync driver outcome files (#1572) -----------------------
+#
+# AGMSG_SQLITE_OUTCOME_FILE (lib/storage.sh `_agmsg_sqlite_recording`, read by
+# scripts/internal/storage-sync-driver.sh) used to go unremoved on every
+# ordinary successful "apply"/"read-apply" call before #1572, on an install
+# made before that fix. See lib/stale-outcome-files.sh for the exact match
+# criteria (location, name, size, content, age) this only ever removes a
+# file matching all of.
+STALE_OUTCOME_FILES=""
+_doctor_scan_stale_outcome_files() {
+  STALE_OUTCOME_FILES="$(agmsg_stale_outcome_candidates)"
+}
+
+_doctor_print_stale_outcome_files() {
+  local n dir example_n=0
+  [ -n "$STALE_OUTCOME_FILES" ] || return 0
+  n="$(printf '%s\n' "$STALE_OUTCOME_FILES" | grep -c . || true)"
+  dir="$(_agmsg_stale_outcome_dir)"
+  echo "leaked storage sync driver outcome files in $dir (#1572, fixed; left over from before the fix) ($n):"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    example_n=$((example_n + 1))
+    [ "$example_n" -le 5 ] || continue
+    echo "  $f"
+  done <<< "$STALE_OUTCOME_FILES"
+  if [ "$n" -gt 5 ]; then echo "  ... and $((n - 5)) more"; fi
+  echo "  remove them with: doctor.sh --fix"
+  echo
+}
+
+# --- --fix: its own mode, not a flag on the report -------------------------
+#
+# Lists what would go, asks once (--yes skips only the question), then removes
+# exactly the files it listed, each by its own path. It deliberately does NOT
+# reuse team.sh --delete's sweep: that one matches by team and agent name and
+# also removes codex-bridge.<team>.<name>.*, whose dot-joined key collides
+# across teams (live team "live" / agent "part.worker" spells the same as gone
+# team "live.part" / agent "worker") -- a file this mode never showed. Never
+# removes an ambiguous record and never touches a team that exists.
+if [ "$FIX" = 1 ]; then
+  if [ -n "$FILTER_PROJECT$FILTER_TYPE$FILTER_TEAM" ] || [ "$REDACTED" = 1 ]; then
+    echo "doctor: --fix takes no --project/--type/--team/--redacted" >&2
+    exit 2
+  fi
+  _doctor_scan_orphan_run_records
+  _doctor_scan_stale_outcome_files
+  if [ -z "$ORPHAN_SEATS" ] && [ -z "$STALE_OUTCOME_FILES" ]; then
+    echo "nothing to fix: no orphaned run/ records, no leaked outcome files."
+    if [ -n "$ORPHAN_AMBIGUOUS" ]; then echo; _doctor_print_orphans; fi
+    exit 0
+  fi
+  _doctor_aborted=0
+  if [ -n "$ORPHAN_SEATS" ]; then
+    _doctor_print_orphans
+    if [ "$ASSUME_YES" != 1 ]; then
+      printf 'Remove the orphaned run/ records listed above? (y/n) [n]: '
+      read -r _doctor_answer || _doctor_answer=""
+      case "$_doctor_answer" in y|Y) ;; *) echo "Aborted; run/ records not removed."; _doctor_aborted=1; _doctor_answer="" ;; esac
+    else
+      _doctor_answer=y
+    fi
+    case "$_doctor_answer" in
+      y|Y)
+        _doctor_removed=0 _doctor_skipped=0
+        while IFS="$_DOCTOR_US" read -r _s _team _agent _pane _files; do
+          [ -n "$_s" ] || continue
+          # The scan is older than the question above: a team of this name may
+          # have been created while it waited, and its records now belong to a
+          # live team. Checked again, right before each seat's files go.
+          _enc_team="$(_actas_lock_encode "$_team")"
+          case $'\n'"$(_doctor_existing_enc_teams)"$'\n' in
+            *$'\n'"$_enc_team"$'\n'*) _doctor_skipped=$((_doctor_skipped + 1)); continue ;;
+          esac
+          for _f in $_files; do
+            rm -f "$RUN_DIR/$_f"
+          done
+          _doctor_removed=$((_doctor_removed + 1))
+        done <<< "$ORPHAN_SEATS"
+        echo "removed the run/ records of $_doctor_removed seat(s)."
+        if [ "$_doctor_skipped" -gt 0 ]; then
+          echo "left $_doctor_skipped seat(s) alone: their team exists now."
+        fi
+        ;;
+    esac
+  fi
+  if [ -z "$ORPHAN_SEATS" ] && [ -n "$ORPHAN_AMBIGUOUS" ]; then
+    # Only reached here when ORPHAN_SEATS was empty: otherwise the call
+    # above already printed this section too (it prints both at once).
+    _doctor_print_orphans
+  fi
+  # Independent of the orphan-records section above: either can be present
+  # without the other, so one being empty (or its own prompt declined) never
+  # skips the other.
+  if [ -n "$STALE_OUTCOME_FILES" ]; then
+    [ -n "$ORPHAN_SEATS$ORPHAN_AMBIGUOUS" ] && echo
+    _doctor_print_stale_outcome_files
+    if [ "$ASSUME_YES" != 1 ]; then
+      printf 'Remove the leaked outcome files listed above? (y/n) [n]: '
+      read -r _doctor_answer || _doctor_answer=""
+      case "$_doctor_answer" in y|Y) ;; *) echo "Aborted; outcome files not removed."; _doctor_aborted=1; _doctor_answer="" ;; esac
+    else
+      _doctor_answer=y
+    fi
+    case "$_doctor_answer" in
+      y|Y)
+        _doctor_outcome_removed="$(printf '%s\n' "$STALE_OUTCOME_FILES" | agmsg_remove_stale_outcome_files)"
+        echo "removed $_doctor_outcome_removed leaked outcome file(s)."
+        ;;
+    esac
+  fi
+  [ "$_doctor_aborted" -eq 0 ] || exit 1
+  exit 0
+fi
+
+# --project / --type / --team all validated here, before any scope work:
+# an unknown --type or --team is a usage error (exit 2), not left to fail
+# quietly into an empty scope -- same "no silent empty-looks-clean report"
+# reasoning as the original <project> <type> form's type check. An unknown
+# --project has no fixed enum to check against; it falls through to the
+# generic "no registrations match this scope" exit 2 below instead, which
+# reaches the same exit code by the same means every other empty scope does.
+if [ -n "$FILTER_TYPE" ] && ! agmsg_is_known_type "$FILTER_TYPE"; then
+  echo "doctor: unknown agent type: '$FILTER_TYPE' (supported: $(agmsg_known_types | sort -u | paste -sd, - | sed 's/,/, /g'))" >&2
+  exit 2
+fi
+if [ -n "$FILTER_TEAM" ]; then
+  # --team becomes a path segment below (teams/$FILTER_TEAM/config.json,
+  # both here and inside agmsg_registered_projects) whether or not it turns
+  # out to name a real team -- validate.sh's header names every entry point
+  # that does this ("join.sh, leave.sh, team.sh, rename.sh, rename-team.sh")
+  # for exactly this reason: an unvalidated value containing "..", "/", or
+  # similar can resolve to a config-shaped file outside teams/ entirely. This
+  # is doctor.sh's first --team-shaped entry point, so it needs the same
+  # validator every other one already runs through -- not a new check, just
+  # this file failing to call the existing one. Runs BEFORE the existence
+  # check below: a value validate.sh rejects should never even reach a
+  # filesystem lookup.
+  agmsg_validate_team_name "$FILTER_TEAM" || exit 2
+  if [ ! -f "$SKILL_DIR/teams/$FILTER_TEAM/config.json" ]; then
+    echo "doctor: unknown team: '$FILTER_TEAM'" >&2
+    exit 2
+  fi
+fi
+
+# Keep only the "<team>\t<agent>" lines belonging to FILTER_TEAM. A no-op
+# (prints input unchanged) when no --team was given. Needed in two places:
+# narrowing a (project, type) pair's own registration rows to just the
+# requested team, and (identically) deciding whether that team has ANY
+# registration at a candidate pair while building SCOPE below.
+_team_filter_lines() {
+  local input="$1" team="$2" t a
+  [ -n "$team" ] || { printf '%s' "$input"; return 0; }
+  while IFS=$'\t' read -r t a; do
+    [ -z "$t" ] && continue
+    [ "$t" = "$team" ] && printf '%s\t%s\n' "$t" "$a"
+  done <<< "$input"
+  # A while loop's own exit status is whatever its LAST executed command
+  # left behind -- here, "[ "$t" = "$team" ] && printf ...", whose short-
+  # circuiting means a NON-matching final input line leaves exit 1, even
+  # though filtering out a non-match is completely normal. Every caller of
+  # this function assigns its output via a bare command substitution (no
+  # `|| true`), so under set -e that leaked 1 aborted the whole script --
+  # silently, with no output at all, whenever --team's target sorted before
+  # some other team on the LAST row of a pair's registrations (identities.sh
+  # orders by team name, so this depended on which teams happened to share a
+  # project/type and how their names compared). Found by running --team
+  # against the real installation, where this ordering wasn't in this
+  # branch's favor. return 0 makes "ran to completion, matched or not" the
+  # function's actual contract, matching what every caller already assumes.
+  return 0
+}
+
+# --- scope: build the (project, type) pairs to scan --------------------
+#
+# One output format regardless of which filters were given: newline-separated
+# "project<TAB>type". Everything downstream just iterates this list -- the
+# per-pair judgment logic (_doctor_scan_pair) is identical regardless of how
+# the list was built.
+SCOPE=""
+
+while IFS= read -r _type; do
+  [ -n "$_type" ] || continue
+  if [ -n "$FILTER_PROJECT" ]; then
+    # --project given: no single resolve call applies without a type, so this
+    # loops it across every type being scanned (all known types, or just
+    # FILTER_TYPE), exactly as identities.sh is then used to confirm a real
+    # registration exists there. (An earlier version tried to match the input
+    # against agmsg_registered_projects by canonicalizing both sides -- wrong
+    # on macOS, where agmsg_canonical_path resolves the /var -> /private/var
+    # symlink but the registry stores whatever raw path join.sh was given, so
+    # a real registration never matched. agmsg_resolve_project already gets
+    # this right per type; reusing it here sidesteps reinventing that
+    # matching a second time.) FILTER_TEAM, if given, scopes both the
+    # resolution's registry fallback AND which registration counts as a hit.
+    _resolved="$(agmsg_resolve_project "$FILTER_PROJECT" "$_type" "$FILTER_TEAM")"
+    _hit="$("$SCRIPT_DIR/identities.sh" "$_resolved" "$_type")"
+    _hit="$(_team_filter_lines "$_hit" "$FILTER_TEAM")"
+    if [ -n "$_hit" ]; then
+      SCOPE="${SCOPE}${_resolved}"$'\t'"${_type}"$'\n'
+    fi
+  else
+    # No --project: every project registered for this type (agmsg_registered_projects's
+    # own team param does the --team narrowing here, at the source, rather than
+    # listing everyone's projects and filtering after). sort -u because
+    # agmsg_registered_projects dedups WITHIN one team's config.json via SQL
+    # DISTINCT, but concatenates every scanned team's config.json results with
+    # no cross-file dedup -- a project registered under two different teams (a
+    # real shape: two teams sharing one workspace) comes back twice when no
+    # --team narrows it to one file, and without sort -u here that turns into
+    # the same (project, type) pair scanned and reported twice, with summary
+    # counts inflated to match. Confirmed by direct inspection of its raw
+    # output before this fix landed.
+    while IFS= read -r _proj; do
+      [ -n "$_proj" ] || continue
+      SCOPE="${SCOPE}${_proj}"$'\t'"${_type}"$'\n'
+    done <<< "$(agmsg_registered_projects "$_type" "$FILTER_TEAM" | sort -u)"
+  fi
+done <<< "$(if [ -n "$FILTER_TYPE" ]; then printf '%s\n' "$FILTER_TYPE"; else agmsg_known_types | sort -u; fi)"
+unset _type _proj _resolved _hit
+
+# An empty SCOPE means two different things depending on whether a filter
+# narrowed it: an EXPLICIT --project/--type/--team that matched nothing is
+# almost certainly a mistake (a typo'd project path, a team that doesn't
+# exist) -- exit 2, as before. But no filters at all, on an installation
+# that genuinely has zero registrations anywhere, is a VALID whole-install
+# scan whose answer happens to be empty -- that is not a usage error, and
+# treating it as one meant "diagnose an empty installation" itself failed
+# doctor's own exit-code contract. Falls through to the normal report path
+# below, which -- with SCOPE empty -- naturally produces a clean "0 team(s),
+# 0 registration(s), 0 warning(s)" / "no warnings." / exit 0 with no special
+# casing needed there.
+if [ -z "$SCOPE" ] && { [ -n "$FILTER_PROJECT" ] || [ -n "$FILTER_TYPE" ] || [ -n "$FILTER_TEAM" ]; }; then
+  echo "doctor: no registrations match this scope" >&2
+  exit 2
+fi
+
+WARNINGS=""
+_warn() { WARNINGS="${WARNINGS}$1"$'\n'; }
+
+# --- redaction: consistent pseudonyms, not one-off masking -----------------
+#
+# One pseudonym table for the WHOLE run, not per (project, type) pair: with
+# --all spanning multiple projects, the same team/agent appearing under two
+# different projects has to read as the same pseudonym both times, or the
+# output stops being cross-referenceable against itself.
+#
+# A fixed team1/agent1 substitution (not a hash) so the same name reads the
+# same way everywhere it appears in one run -- the #605 reporter hand-redacted
+# their own report exactly this way (generic team/agent names, home-relative
+# project path); this does the same substitution instead of leaving it to
+# whoever pastes the output into a bug report.
+# Sets _REDACT_OUT in the CALLER's shell rather than printf+$(...): a pair
+# assigned inside a command substitution is a subshell, and the whole point
+# here is a mutation (_R_TEAM_K/_R_TEAM_V growing) that has to survive past
+# the call. role-session.sh's _agmsg_role_session_path_into hit this same
+# shape first -- "a cache entry is only kept when the helper runs in the
+# caller's own shell" applies just as much to a pseudonym table as a memo.
+_R_TEAM_K=(); _R_TEAM_V=(); _R_AGENT_K=(); _R_AGENT_V=()
+_redact_team() {
+  [ "$REDACTED" = 1 ] || { _REDACT_OUT="$1"; return 0; }
+  local i n=${#_R_TEAM_K[@]}
+  for ((i = 0; i < n; i++)); do
+    if [ "${_R_TEAM_K[$i]}" = "$1" ]; then _REDACT_OUT="${_R_TEAM_V[$i]}"; return 0; fi
+  done
+  _R_TEAM_K[$n]="$1"; _R_TEAM_V[$n]="team$((n + 1))"
+  _REDACT_OUT="${_R_TEAM_V[$n]}"
+}
+_redact_agent() {
+  [ "$REDACTED" = 1 ] || { _REDACT_OUT="$1"; return 0; }
+  local i n=${#_R_AGENT_K[@]}
+  for ((i = 0; i < n; i++)); do
+    if [ "${_R_AGENT_K[$i]}" = "$1" ]; then _REDACT_OUT="${_R_AGENT_V[$i]}"; return 0; fi
+  done
+  _R_AGENT_K[$n]="$1"; _R_AGENT_V[$n]="agent$((n + 1))"
+  _REDACT_OUT="${_R_AGENT_V[$n]}"
+}
+# Same idea for project paths as team/agent above: one table for the whole
+# run, so the same project reads as the same pseudonym in every (project,
+# type) block it appears in under --all, not a fresh placeholder each time.
+_R_PROJ_K=(); _R_PROJ_V=()
+_redact_project() {
+  [ "$REDACTED" = 1 ] || { _REDACT_OUT="$1"; return 0; }
+  case "$1" in
+    "$HOME"*) _REDACT_OUT="~${1#"$HOME"}"; return 0 ;;
+  esac
+  local i n=${#_R_PROJ_K[@]}
+  for ((i = 0; i < n; i++)); do
+    if [ "${_R_PROJ_K[$i]}" = "$1" ]; then _REDACT_OUT="${_R_PROJ_V[$i]}"; return 0; fi
+  done
+  _R_PROJ_K[$n]="$1"; _R_PROJ_V[$n]="<project$((n + 1))>"
+  _REDACT_OUT="${_R_PROJ_V[$n]}"
+}
+# Plain output shows the owner token IN FULL -- #605 was actually resolved by
+# matching this exact value against a "codex-bridge: resumed thread <uuid>"
+# line in a bridge log, and a shortened token can't be matched that way. This
+# only shortens under --redacted, where the point is the opposite (safe to
+# paste), and even then splits on the LAST "." rather than a fixed tail
+# length: a fixed suffix cuts at a different point depending on how long the
+# leading uuid/sid happens to be, while the part after the last "." is the
+# pid every composite token carries -- consistently shaped, and still useful
+# on its own (`ps -p <pid>`) even with the rest hidden. A bare token (no ".")
+# has no such split point, so that case keeps the old fixed-tail form.
+_redact_owner() {
+  [ "$REDACTED" = 1 ] || { printf '%s' "$1"; return 0; }
+  [ -n "$1" ] || return 0
+  if agmsg_instance_is_composite "$1"; then
+    printf '...%s' "${1##*.}"
+  else
+    printf '...%s' "${1: -6}"
+  fi
+}
+# Literal (not glob, not regex) substring replace. A quoted portion of a
+# case/parameter-expansion pattern matches literally regardless of what it
+# contains, so this needs no escaping for team/agent names or paths that
+# happen to hold *, ?, [, or other glob/regex metacharacters. Portable to
+# bash 3.2 (macOS).
+_replace_literal() {
+  local rest="$1" needle="$2" repl="$3" out=""
+  [ -n "$needle" ] || { printf '%s' "$rest"; return 0; }
+  while true; do
+    case "$rest" in
+      *"$needle"*)
+        out="$out${rest%%"$needle"*}$repl"
+        rest="${rest#*"$needle"}"
+        ;;
+      *) break ;;
+    esac
+  done
+  printf '%s%s' "$out" "$rest"
+}
+# Applies the SAME substitutions as the fields above to a block of TEXT this
+# script did not format itself (delivery.sh's own output) -- --redacted's
+# only promise is "safe to paste", so text quoted wholesale from elsewhere
+# has to go through the same pseudonym table and $HOME masking as everything
+# doctor.sh builds by hand, not get echoed as-is. Takes the CURRENT pair's
+# resolved project explicitly (not a global) -- under --all this runs once
+# per (project, type) block, each with a different project.
+#
+# No word boundaries: a team/agent name that also occurs as a substring
+# elsewhere in the text (e.g. a team named "agmsg" inside a path like
+# ~/.agents/skills/agmsg/run/...) gets replaced there too. Deliberately not
+# fixed -- the failure direction is over-redaction, not a leak, which is the
+# side --redacted is supposed to fail on.
+_redact_text() {
+  local text="$1" project="$2" i n
+  [ "$REDACTED" = 1 ] || { printf '%s' "$text"; return 0; }
+  text="$(_replace_literal "$text" "$HOME" "~")"
+  # A project outside $HOME survives the substitution above untouched (no
+  # $HOME prefix to catch), and delivery.sh's own output names it directly
+  # (its settings-hooks-file path is under it) -- so the exact resolved path
+  # is masked here too, the same pseudonym _redact_project produces for it.
+  _redact_project "$project"
+  text="$(_replace_literal "$text" "$project" "$_REDACT_OUT")"
+  n=${#_R_TEAM_K[@]}
+  for ((i = 0; i < n; i++)); do
+    text="$(_replace_literal "$text" "${_R_TEAM_K[$i]}" "${_R_TEAM_V[$i]}")"
+  done
+  n=${#_R_AGENT_K[@]}
+  for ((i = 0; i < n; i++)); do
+    text="$(_replace_literal "$text" "${_R_AGENT_K[$i]}" "${_R_AGENT_V[$i]}")"
+  done
+  printf '%s' "$text"
+}
+
+# --- scan one (project, type) pair, buffer its block ------------------------
+#
+# Buffered into REPORT_BLOCKS rather than printed inline: the summary line
+# has to come FIRST on screen -- it is the first thing the person who ran
+# the command looks at -- but its counts (teams/registrations/warnings)
+# aren't known until every pair in the scope has been scanned. Nothing here is large enough for
+# buffering to matter -- even the whole install across every team is a
+# handful of KB.
+REPORT_BLOCKS=""
+TOTAL_PAIR_COUNT=0
+# The "watch processes: N alive, M stale pidfiles" line the default runtime
+# status emits scans the WHOLE run/ directory, not any one (project, type)'s
+# own state -- an installation-wide fact, not a per-pair one. Captured ONCE
+# here, independent of the scope being scanned, via `delivery.sh status` with
+# no <type>/<project> -- do_status's own comment documents this as its
+# no-args path: it skips the project-scoped mode line and just reports the
+# global watcher state. This independence matters: an earlier version
+# captured it opportunistically from whichever pair's own delivery.sh call
+# happened to emit it first, which meant it silently never appeared at all
+# on an installation whose registrations are ALL a no-delivery type (skips
+# the call) and/or codex (overrides runtime status with its own per-role
+# bridge lines instead of this one) -- an install like that would lose
+# run/watch.*.pid stale-watcher detection entirely, not just deduplicate it.
+# Caught in review; the fix is scanning run/ once, unconditionally, not
+# deduplicating a per-pair emission that may never happen.
+GLOBAL_WATCH_LINE="$(bash "$SCRIPT_DIR/delivery.sh" status 2>&1 | grep '^watch processes: ' | head -1 || true)"
+_doctor_scan_pair() {
+  local project="$1" type="$2"
+
+  # Whether this type already reports its own per-role runtime status
+  # (codex's _delivery.sh does, via the embedded delivery-status block --
+  # one "Codex bridge: team/agent ..." line per role). Everything else
+  # (currently claude-code, opencode) falls through to the default runtime
+  # status, which is a single project-wide count with no per-role
+  # breakdown, so those types get the watcher= field built below instead.
+  # Detected structurally (does the type's plug override the function)
+  # rather than hardcoding "codex", so a future type with its own per-role
+  # reporting is picked up automatically.
+  local type_has_role_runtime=0 type_plug="$SKILL_DIR/scripts/drivers/types/$type/_delivery.sh"
+  if [ -f "$type_plug" ] && grep -q '^agmsg_delivery_runtime_status()' "$type_plug" 2>/dev/null; then
+    type_has_role_runtime=1
+  fi
+
+  # Whether this type has ANY real delivery to ask about. delivery_modes= in
+  # the type's manifest lists every mode the type can be SET to; a type whose
+  # list is nothing but "off" (agmsg-app, hermes) has no agmsg-side delivery
+  # at all -- agmsg-app is the desktop app's own identity, which owns its
+  # own send/receive UI. Querying delivery.sh status for such a type exits 1
+  # by design (there's nothing to report), and this doctor was turning that
+  # into a WARNING on an otherwise completely healthy installation -- a real
+  # installation, run once, came back "9 team(s), 56 registration(s), 5
+  # warning(s)" purely from this, violating the exit-code contract this
+  # command promised on day one (0 = nothing to report). Checked via the
+  # manifest (agmsg_type_get, already used by PR #631 for the same key) so a
+  # future no-delivery type is picked up the same way automatically, rather
+  # than by name.
+  local type_has_delivery=0 _dm_tok
+  for _dm_tok in $(agmsg_type_get "$type" delivery_modes); do
+    if [ "$_dm_tok" != "off" ]; then
+      type_has_delivery=1
+      break
+    fi
+  done
+  unset _dm_tok
+
+  # Shelled out to the real CLI (not sourced): delivery.sh dispatches on argv
+  # at file scope, so sourcing it would run that dispatch. Reused verbatim
+  # (through _redact_text) -- the type-specific per-role bridge liveness
+  # this project already has (codex's _delivery.sh) is not worth a second
+  # implementation here. Trade-off: MODE and the stale-pidfile warnings
+  # below are parsed out of this human-readable text, so if delivery.sh's
+  # wording changes, both go silent (no warning, not a wrong one) rather
+  # than erroring -- a duplicated implementation would drift instead of
+  # going quiet, which is worse. Flagged here so whoever next changes
+  # delivery.sh's status wording knows to check.
+  local delivery_status=0 delivery_output="" mode_line="" mode="off"
+  if [ "$type_has_delivery" -eq 1 ]; then
+    delivery_output="$(bash "$SCRIPT_DIR/delivery.sh" status "$type" "$project" 2>&1)" || delivery_status=$?
+    mode_line="$(printf '%s\n' "$delivery_output" | head -1)"
+    mode="${mode_line#mode: }"
+
+    # This pair's own delivery.sh call may ALSO emit the same global line
+    # (default runtime status, when this type doesn't override it) -- always
+    # captured independently above now, so here it's only ever stripped out
+    # of this pair's own text, never (re-)captured from it. delivery.sh
+    # always emits "mode: ..." before this line when given a type/project
+    # (do_status runs agmsg_delivery_status first, unconditionally), so this
+    # grep -v never filters every line away in practice -- guarded with
+    # || true anyway rather than leaning on that ordering under set -e.
+    delivery_output="$(printf '%s\n' "$delivery_output" | grep -v '^watch processes: ' || true)"
+  fi
+
+  # Tracks whether this pair turned out to have anything worth a full block:
+  # a warning count taken before/after (any _warn call below flips this,
+  # without needing every call site to also set a flag), plus "any lock held
+  # at all" and "delivery has more than a bare idle mode line" below. All
+  # three false is exactly the shape a healthy, unconfigured project/type has
+  # -- 27 such groups on a real install were each 6 lines to say nothing,
+  # which is what made the report unreadable at real scale.
+  local _warn_count_before
+  _warn_count_before="$(printf '%s\n' "$WARNINGS" | grep -c . || true)"
+
+  local pairs pair_count reg_lines="" first_team="" first_agent="" _any_owner=0
+  pairs="$("$SCRIPT_DIR/identities.sh" "$project" "$type")"
+  # FILTER_TEAM, when set, narrows the report to that team's own rows -- a
+  # pair SCOPE already guaranteed has at least one registration for that
+  # team (see the --project branch above / agmsg_registered_projects's team
+  # param), so this never empties a pair SCOPE included.
+  pairs="$(_team_filter_lines "$pairs" "$FILTER_TEAM")"
+  pair_count="$(printf '%s\n' "$pairs" | grep -c . || true)"
+  TOTAL_PAIR_COUNT=$((TOTAL_PAIR_COUNT + pair_count))
+
+  local team agent dteam dagent owner alive_word cc_note pid
+  local wpidfile wpid watcher_note first_dteam first_dagent
+  if [ "$pair_count" -gt 0 ]; then
+    while IFS=$'\t' read -r team agent; do
+      [ -z "$team" ] && continue
+      [ -n "$first_team" ] || { first_team="$team"; first_agent="$agent"; }
+
+      _redact_team "$team"; dteam="$_REDACT_OUT"
+      _redact_agent "$agent"; dagent="$_REDACT_OUT"
+      # `lock=none` is a claim about the world; an unreadable lock is a claim
+      # about us. The reader that fed this line answered "" for both, so doctor
+      # printed "no lock" for a lock it could not read — which is exactly the
+      # output an operator uses to conclude there is nothing here to clean up.
+      # (Review.) A real instance the same day: someone read a record they could
+      # not open, reported
+      # a seat as dead, and it was alive. A diagnostic that says `none` when it
+      # means `could not look` makes people repeat that. Three reads, three
+      # words. (#983)
+      _own_r="$(actas_lock_read "$team" "$agent")"
+      case "${_own_r%%$'\t'*}" in
+        unreadable)
+          reg_lines="${reg_lines}$(printf '  %-22s lock=unreadable' "$dteam/$dagent")"$'\n'
+          _redact_project "$project"
+          _warn "[$_REDACT_OUT] lock could not be read: $dteam/$dagent (not reported as absent)"
+          continue
+          ;;
+        absent)
+          reg_lines="${reg_lines}$(printf '  %-22s lock=none' "$dteam/$dagent")"$'\n'
+          continue
+          ;;
+      esac
+      owner="${_own_r#*$'\t'}"
+      # Read fine, and empty. A distinct fact from both of the above: the file is
+      # there and nothing in the tree ever writes it empty, so this is a torn
+      # write, not a free role. Saying `none` here would invite the cleanup that
+      # #1071 is about.
+      if [ -z "$owner" ]; then
+        reg_lines="${reg_lines}$(printf '  %-22s lock=empty' "$dteam/$dagent")"$'\n'
+        _redact_project "$project"
+        _warn "[$_REDACT_OUT] lock file is present but empty: $dteam/$dagent (torn write; not reported as free)"
+        continue
+      fi
+      _any_owner=1
+
+      # Three-way: `alive` is a fact, `STALE` is a fact, and "could not find out"
+      # is neither. Reporting the third as STALE is a diagnostic that invents its
+      # own finding — and doctor's whole job is to be believed. (#983)
+      _alive_rc=0
+      agmsg_instance_alive "$owner" || _alive_rc=$?
+      case "$_alive_rc" in
+        0) alive_word="alive" ;;
+        1) alive_word="STALE"
+           _redact_project "$project"
+           _warn "[$_REDACT_OUT] stale lock: $dteam/$dagent (owner=$(_redact_owner "$owner"))" ;;
+        *) alive_word="unknown"
+           _redact_project "$project"
+           _warn "[$_REDACT_OUT] lock owner liveness could not be determined: $dteam/$dagent (owner=$(_redact_owner "$owner")); not treating it as stale" ;;
+      esac
+
+      cc_note=""
+      if agmsg_instance_is_composite "$owner"; then
+        pid="${owner##*.}"
+        if [ -f "$RUN_DIR/cc-instance.$pid" ]; then cc_note=" cc-instance=present"; else cc_note=" cc-instance=absent"; fi
+      fi
+
+      # Per-role watcher liveness -- only for types whose runtime status
+      # doesn't already break this down per role (see type_has_role_runtime
+      # above). The pidfile watch.sh's SessionStart directive writes is
+      # keyed on the SAME normalized instance id actas-claim.sh records as
+      # the lock owner (both go through agmsg_normalize_instance_id on the
+      # same session id), so the owner token IS the watcher's pidfile name
+      # -- no separate lookup or correlation needed, and no liveness logic
+      # of its own: reuses _agmsg_pid_alive_local, the same helper
+      # delivery.sh's own default runtime status calls.
+      watcher_note=""
+      if [ "$type_has_role_runtime" -eq 0 ]; then
+        wpidfile="$RUN_DIR/watch.$owner.pid"
+        if [ -f "$wpidfile" ]; then
+          wpid="$(cat "$wpidfile" 2>/dev/null || true)"
+          if [ -n "$wpid" ] && _agmsg_pid_alive_local "$wpid" 2>/dev/null; then
+            watcher_note=" watcher=running"
+          else
+            watcher_note=" watcher=stale-pidfile"
+          fi
+        else
+          watcher_note=" watcher=none"
+          # Only when the lock itself is legitimately live: a stale lock
+          # having no watcher is unremarkable (already covered above), but
+          # an alive lock with no watcher means the role claims exclusivity
+          # and isn't receiving -- the shape #605 and the reported example
+          # both were.
+          if [ "$alive_word" = "alive" ]; then
+            _redact_project "$project"
+            _warn "[$_REDACT_OUT] actas lock held but no watcher: $dteam/$dagent (owner=$(_redact_owner "$owner"))"
+          fi
+        fi
+      fi
+
+      reg_lines="${reg_lines}$(printf '  %-22s lock=owner(%s)=%s%s%s' "$dteam/$dagent" "$alive_word" "$(_redact_owner "$owner")" "$cc_note" "$watcher_note")"$'\n'
+    done <<< "$pairs"
+
+    if [ "$pair_count" -gt 1 ] && { [ "$mode" = "turn" ] || [ "$mode" = "both" ]; }; then
+      _redact_team "$first_team"; first_dteam="$_REDACT_OUT"
+      _redact_agent "$first_agent"; first_dagent="$_REDACT_OUT"
+      _redact_project "$project"
+      _warn "[$_REDACT_OUT] $pair_count registrations for this (project, type) under turn-mode delivery -- only the first registered ($first_dteam/$first_dagent) receives Stop-hook delivery; the rest are silent under turn"
+    fi
+  fi
+
+  # codex's per-role lines always carry a parenthetical reason (e.g. "stale
+  # pidfile (pid 123 not running)") -- a genuine per-(project, type) fact,
+  # unlike the installation-wide "N stale pidfiles" default-runtime-status
+  # line (captured independently into GLOBAL_WATCH_LINE above and checked
+  # once, globally, after the whole scope has been scanned -- see below the
+  # scan loop).
+  if printf '%s\n' "$delivery_output" | grep -q "stale pidfile ("; then
+    _redact_project "$project"
+    _warn "[$_REDACT_OUT] watcher/bridge pidfile present but process not running (see delivery status above)"
+  fi
+
+  # type is already validated (or came from the registry) before this is
+  # ever called, so this is not the "unknown type" case -- some other
+  # failure inside delivery.sh status itself. Surfaced as a warning rather
+  # than swallowed: showing error text on screen while still reporting
+  # "no warnings." / exit 0 underneath would be a doctor that lies about
+  # its own read. type_has_delivery gates this call happening at all now, so
+  # this can only fire for a type that DOES have delivery to query.
+  if [ "$delivery_status" -ne 0 ]; then
+    _redact_project "$project"
+    _warn "[$_REDACT_OUT] delivery.sh status exited $delivery_status (see delivery status above)"
+  fi
+
+  # "Nothing to report": no lock held (by anyone), no warning raised while
+  # scanning this pair, and delivery has nothing beyond a bare idle mode
+  # line (no type_has_delivery at all, or mode=off with delivery_output --
+  # after the global watch-processes line above was stripped out of it --
+  # amounting to just that one "mode: off" line, no hooks/bridge detail
+  # worth a look). On a real installation this was 27 of the report's
+  # groups, each spending 6 lines to say "nothing here" -- unreadable at
+  # real scale even once the exit-code bug above stops making them warnings.
+  local _warn_count_after
+  _warn_count_after="$(printf '%s\n' "$WARNINGS" | grep -c . || true)"
+  local _delivery_line_count
+  _delivery_line_count="$(printf '%s\n' "$delivery_output" | grep -c . || true)"
+  local _boring=0
+  if [ "$_any_owner" -eq 0 ] \
+    && [ "$_warn_count_after" -eq "$_warn_count_before" ] \
+    && case "$mode" in off\ \(unrecognized:*) false ;; off*) true ;; *) false ;; esac; then
+    _boring=1
+  fi
+
+  _redact_project "$project"
+  # `off` and `off (unrecognized: …)` are not the same state, and only the first
+  # one is boring.
+  #
+  # `off` is a claim about the CONFIGURATION: the settings file was read and no
+  # delivery hooks are installed. Nothing to report.
+  #
+  # `unrecognized` is a claim about THIS CHECK: it could not find or parse the
+  # settings file, so it does not know what the configuration is. Collapsing that
+  # to "nothing to report" tells the operator their delivery is off when what
+  # happened is that we could not tell -- and the annotation it hides ("this
+  # project may not be registered") is the one that explains an empty inbox.
+  #
+  # Measured while merging: this branch's delivery.sh has no bare `off` at all --
+  # all four assignments carry an annotation -- so a condition testing for the
+  # bare word collapses nothing, and one testing the first word collapses
+  # everything including the three unrecognized cases.
+  if [ "$_boring" -eq 1 ]; then
+    local _noun="registrations"
+    [ "$pair_count" -eq 1 ] && _noun="registration"
+    # The path stays on the collapsed line. Of the five lines it replaces, four
+    # repeat what the summary already says (the mode, and "entries: 0" three
+    # times); the path answers a different question -- WHICH file was consulted.
+    # That is the difference between "looked and found nothing" and "did not
+    # look", and it is the distinction this repo keeps paying for when it goes
+    # missing.
+    _boring_conf="$(printf '%s\n' "$delivery_output" | sed -n 's/^settings hooks file: //p' | head -1)"
+    if [ -n "$_boring_conf" ]; then
+      _redact_text_out="$(_redact_text "$_boring_conf" "$project")"
+      REPORT_BLOCKS="${REPORT_BLOCKS}$_REDACT_OUT  [$type]  $pair_count $_noun, nothing to report — $_redact_text_out"$'\n'
+    else
+      REPORT_BLOCKS="${REPORT_BLOCKS}$_REDACT_OUT  [$type]  $pair_count $_noun, nothing to report"$'\n'
+    fi
+  else
+    REPORT_BLOCKS="${REPORT_BLOCKS}project: $_REDACT_OUT"$'\n'
+    REPORT_BLOCKS="${REPORT_BLOCKS}type:    $type"$'\n\n'
+    REPORT_BLOCKS="${REPORT_BLOCKS}$(_redact_text "$delivery_output" "$project")"$'\n\n'
+    REPORT_BLOCKS="${REPORT_BLOCKS}registrations ($pair_count):"$'\n'
+    if [ "$pair_count" -eq 0 ]; then
+      REPORT_BLOCKS="${REPORT_BLOCKS}  (none for this project/type)"$'\n'
+    else
+      REPORT_BLOCKS="${REPORT_BLOCKS}${reg_lines}"
+    fi
+    REPORT_BLOCKS="${REPORT_BLOCKS}"$'\n'
+  fi
+}
+
+# --- run the whole scope, then print summary -> blocks -> warnings --------
+#
+# Team count for the summary line is built alongside the scan (every
+# distinct team name seen across the scope's registrations, not the count
+# of (project, type) pairs) rather than a second pass over SCOPE -- reuses
+# the exact identities.sh call _doctor_scan_pair already makes for the same
+# pair, instead of querying it twice.
+DISTINCT_TEAMS=""
+while IFS=$'\t' read -r _proj _type; do
+  [ -z "$_proj" ] && continue
+  _doctor_scan_pair "$_proj" "$_type"
+  while IFS=$'\t' read -r _team _agent; do
+    [ -z "$_team" ] && continue
+    case $'\n'"$DISTINCT_TEAMS"$'\n' in
+      *$'\n'"$_team"$'\n'*) ;;
+      *) DISTINCT_TEAMS="${DISTINCT_TEAMS}${_team}"$'\n' ;;
+    esac
+  done <<< "$(_team_filter_lines "$("$SCRIPT_DIR/identities.sh" "$_proj" "$_type")" "$FILTER_TEAM")"
+done <<< "$SCOPE"
+TEAM_COUNT="$(printf '%s\n' "$DISTINCT_TEAMS" | grep -c . || true)"
+
+# GLOBAL_WATCH_LINE's own stale-pidfile count is an installation-wide fact
+# (see where it's captured in _doctor_scan_pair) -- checked here, ONCE, for
+# the whole run, rather than once per pair scanned. Reuses the exact same
+# text the per-pair codex check above parses a different (per-role) line
+# from; this just applies that same parsing to the one line that is global.
+if [ -n "$GLOBAL_WATCH_LINE" ]; then
+  GLOBAL_STALE_COUNT="$(printf '%s\n' "$GLOBAL_WATCH_LINE" | sed -n 's/.*, \([0-9]*\) stale pidfiles*$/\1/p')"
+  case "$GLOBAL_STALE_COUNT" in ''|*[!0-9]*) GLOBAL_STALE_COUNT=0 ;; esac
+  if [ "$GLOBAL_STALE_COUNT" -gt 0 ]; then
+    _warn "watcher pidfile present but process not running, installation-wide (see the 'watch processes' line above)"
+  fi
+fi
+# Orphaned per-seat run/ records (#1507): like the watcher line above, an
+# installation-wide fact -- no --project/--type/--team narrows it. Reported and
+# counted here, never removed (see --fix).
+_doctor_scan_orphan_run_records
+if [ -n "$ORPHAN_SEATS" ]; then
+  _warn "run/ holds records of seat(s) whose team no longer exists, and they can keep claiming a pane (see 'orphaned run/ records' above); fix them with: doctor.sh --fix"
+fi
+if [ -n "$ORPHAN_AMBIGUOUS" ]; then
+  _warn "run/ holds records for a team that no longer exists that cannot be attributed to one seat (\"__\" inside a name); they are left alone, remove them by hand"
+fi
+# Registry locks with no holder record (#865): also installation-wide. Nothing
+# else ever breaks one, so a team that keeps timing out on its lock lands here.
+_doctor_scan_record_less_locks
+if [ -n "$LOCKS_NO_RECORD" ]; then
+  _warn "teams/ holds registry lock(s) with no holder record, and every command for those teams waits on them (see 'registry locks with no holder record' above); the rmdir to run by hand is listed there, only when every agmsg sync and seat is stopped"
+fi
+# Leaked storage sync driver outcome files (#1572): installation-wide too,
+# and only ever left by an install made before that fix.
+_doctor_scan_stale_outcome_files
+if [ -n "$STALE_OUTCOME_FILES" ]; then
+  _warn "$(_agmsg_stale_outcome_dir) holds leaked storage sync driver outcome file(s) from before #1572 (see 'leaked storage sync driver outcome files' above); fix them with: doctor.sh --fix"
+fi
+WARN_COUNT="$(printf '%s\n' "$WARNINGS" | grep -c . || true)"
+
+echo "$TEAM_COUNT team(s), $TOTAL_PAIR_COUNT registration(s), $WARN_COUNT warning(s)"
+echo
+if [ -n "$GLOBAL_WATCH_LINE" ]; then
+  echo "$GLOBAL_WATCH_LINE"
+  echo
+fi
+printf '%s' "$REPORT_BLOCKS"
+_doctor_print_orphans
+_doctor_print_locks
+_doctor_print_stale_outcome_files
+
+if [ -n "$WARNINGS" ]; then
+  echo "warnings:"
+  printf '%s' "$WARNINGS" | sed 's/^/  - /'
+  exit 1
+fi
+echo "no warnings."
+exit 0

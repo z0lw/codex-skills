@@ -1,0 +1,7 @@
+interface:
+  display_name: "ChatGPT Project Reader"
+  short_description: "Read relevant ChatGPT project chats"
+  default_prompt: "Use $chatgpt-project-reader to open the relevant ChatGPT Project for this Codex workspace and summarize the requested past chat context read-only."
+
+policy:
+  allow_implicit_invocation: true

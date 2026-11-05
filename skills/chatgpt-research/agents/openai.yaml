@@ -1,0 +1,4 @@
+interface:
+  display_name: "chatgpt-research"
+  short_description: "ChatGPTに調査を依頼し、出典付き回答を回収して判断材料を確認する"
+  default_prompt: "$chatgpt-research を使い、この論点をChatGPTに調査させて、出典と結論を確認してください。"

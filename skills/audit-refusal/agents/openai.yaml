@@ -1,0 +1,4 @@
+interface:
+  display_name: "拒否の検査"
+  short_description: "拒否理由が本当に成立するか検査する"
+  default_prompt: "$audit-refusal を使い、いま断ろうとしている理由が実際に成立するか検査してください。"

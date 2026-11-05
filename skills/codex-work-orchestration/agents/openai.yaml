@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Work Orchestration"
+  short_description: "Coordinate dependencies, handoffs, and continuity"
+  default_prompt: "Use $codex-work-orchestration to coordinate the required worker dependencies, handoff, or continuity for this task."

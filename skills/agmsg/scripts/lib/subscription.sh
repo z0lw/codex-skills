@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Shared subscription helpers for live watchers and one-shot pending checks.
+#
+# Required caller-set variables:
+#   SKILL_DIR  agmsg skill root
+
+: "${SKILL_DIR:?subscription.sh requires SKILL_DIR}"
+
+agmsg_sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
+
+# Resolve the (team, agent) rows this process should receive for.
+#
+# Usage:
+#   agmsg_subscription_pairs <project> <type> <owner_id> [active_name] [claim]
+#
+# `owner_id` is the current session/instance token used for actas ownership.
+# When `active_name` is set, only that agent name is kept. When the final
+# argument is `claim`, the helper attempts to claim each active pair for
+# `owner_id`, matching watch.sh actas mode.
+agmsg_subscription_pairs() {
+  local project="$1" type="$2" owner_id="$3" active_name="${4:-}" claim_mode="${5:-}"
+  local scripts_dir="$SKILL_DIR/scripts"
+  local pairs filtered skipped skip_facts held state result cc
+
+  pairs="$("$scripts_dir/identities.sh" "$project" "$type")"
+  if [ -n "$active_name" ]; then
+    pairs=$(printf '%s\n' "$pairs" | awk -v n="$active_name" -F'\t' 'NF >= 2 && $2 == n')
+  fi
+
+  [ -n "$pairs" ] || return 0
+
+  filtered=""
+  skipped=""
+  skip_facts=""
+  held=""
+  local team agent
+  while IFS=$'\t' read -r team agent; do
+    [ -z "$team" ] && continue
+    state=$(actas_lock_state "$team" "$agent" "$owner_id")
+    case "$state" in
+      # `unknown:` is not "free to subscribe". Falling through would keep the
+      # pair in the filtered set AND claim it below, on a state nobody
+      # established — the permissive direction, and the one that puts two
+      # sessions on one role. Skipped like a held pair, with its own word so the
+      # reason is not reported as someone else holding it. (#983)
+      unknown:*)
+        skipped="${skipped:+$skipped }${team}/${agent}(unverified:${state#unknown:})"
+        continue
+        ;;
+      other:*)
+        if [ -n "$active_name" ] && [ "$claim_mode" = "claim" ]; then
+          held="${held:+$held }${team}/${agent}(${state#other:})"
+        else
+          skipped="${skipped:+$skipped }${team}/${agent}(${state#other:})"   # held by that session
+          # The two facts #605 needs that the line above doesn't carry: the
+          # lock file's real path (percent-encoded, not reconstructable by
+          # hand) and whether cc-instance.<pid> backs a composite owner --
+          # absent there is instance-id.sh's unconditional-alive branch.
+          skip_facts="${skip_facts}agmsg watch:   lock=$(actas_lock_path "$team" "$agent")"
+          if agmsg_instance_is_composite "${state#other:}"; then
+            cc="absent"
+            [ -f "$SKILL_DIR/run/cc-instance.${state##*.}" ] && cc="present"
+            skip_facts="$skip_facts cc-instance=$cc"
+          fi
+          skip_facts="$skip_facts"$'\n'
+        fi
+        continue
+        ;;
+    esac
+
+    if [ -n "$active_name" ] && [ "$claim_mode" = "claim" ]; then
+      result=$(actas_lock_claim "$team" "$agent" "$owner_id" 2>/dev/null || true)
+      # Same rule as watch.sh: only an explicit `ok` subscribes, and the default
+      # arm refuses. Listing the failures and defaulting to success is what let a
+      # claim that never happened put a pair into the subscribed set. (#983)
+      case "$result" in
+        ok) : ;;
+        held:*)
+          held="${held:+$held }${team}/${agent}(${result#held:})"
+          continue
+          ;;
+        unknown:*)
+          skipped="${skipped:+$skipped }${team}/${agent}(unverified:${result#unknown:})"
+          continue
+          ;;
+        *)
+          skipped="${skipped:+$skipped }${team}/${agent}(unverified:claim_unrecognized)"
+          continue
+          ;;
+      esac
+    fi
+
+    filtered="${filtered:+$filtered$'\n'}${team}"$'\t'"${agent}"
+  done <<< "$pairs"
+
+  if [ -n "$skipped" ]; then
+    # Same as watch.sh: this list mixes pairs held by a live peer with pairs
+    # whose lock could not be read. Only the first kind has a holder. (#983)
+    echo "agmsg watch: not serving these pairs (held by another session, or unverified): $skipped" >&2
+    # Only when the exclusion left nothing to subscribe to (#605) -- a busy
+    # pair alongside others that still resolve stays quiet.
+    if [ -z "$filtered" ]; then
+      printf '%s' "$skip_facts" >&2
+    fi
+  fi
+  if [ -n "$held" ]; then
+    echo "agmsg watch: cannot claim (held by other sessions): $held" >&2
+    echo "agmsg watch: run \`/agmsg drop <name>\` in the owning session, then retry." >&2
+    return 1
+  fi
+
+  printf '%s' "$filtered"
+}

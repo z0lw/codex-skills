@@ -1,0 +1,4 @@
+interface:
+  display_name: "Chrome Profile Routing"
+  short_description: "必要なChromeプロファイルと実接続経路だけを安全に選択"
+  default_prompt: "Use $chrome-profile-routing when this task actually needs a specific Chrome profile or signed-in browser route."

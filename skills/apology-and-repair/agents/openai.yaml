@@ -1,0 +1,4 @@
+interface:
+  display_name: "謝罪と是正"
+  short_description: "明示要求された謝罪・反省・強い責任表現と是正復帰を実行"
+  default_prompt: "Use $apology-and-repair only when I explicitly ask Codex to apologize, reflect, or follow a specified accountability format."

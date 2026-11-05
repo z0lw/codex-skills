@@ -1,0 +1,4 @@
+interface:
+  display_name: "X/Twitter Safe Relay Search"
+  short_description: "Search X/Twitter through the logged-in safe relay"
+  default_prompt: "Use $search-x-with-safe-relay to find current X/Twitter posts and summarize them with direct links."

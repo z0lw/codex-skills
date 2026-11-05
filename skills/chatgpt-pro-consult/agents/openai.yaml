@@ -1,0 +1,7 @@
+interface:
+  display_name: "ChatGPT Pro Consult"
+  short_description: "ChatGPT Pro相談をCodex内ブラウザで厳密実行"
+  default_prompt: "Use $chatgpt-pro-consult to consult ChatGPT Pro through the Codex in-app browser, verify visible Pro, integrate the answer, and resume the original task."
+
+policy:
+  allow_implicit_invocation: true
