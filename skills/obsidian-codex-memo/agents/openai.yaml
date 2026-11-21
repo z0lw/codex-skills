@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex Memo"
+  short_description: "Keep lightweight notes outside existing projects"
+  default_prompt: "Use $obsidian-codex-memo to save this standalone rough note outside existing projects."
+policy:
+  allow_implicit_invocation: true

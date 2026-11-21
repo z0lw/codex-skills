@@ -1,0 +1,4 @@
+interface:
+  display_name: "Claude Worker"
+  short_description: "Claude Code CLI指定の作業・Fable直接相談を実行"
+  default_prompt: "Use $claude-worker for the requested Claude Code CLI task or CLI-based Fable consultation; prefer native Codex agents for general model consultations."

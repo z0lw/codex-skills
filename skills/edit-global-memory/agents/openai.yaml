@@ -1,0 +1,4 @@
+interface:
+  display_name: "グローバルメモリの編集"
+  short_description: "メモリの恒久的な訂正と整理"
+  default_prompt: "$edit-global-memory で、本人の依頼と訂正を原文で確かめ、変更が要るかを判断してから、別の担当に編集させて差分を照合してください。"

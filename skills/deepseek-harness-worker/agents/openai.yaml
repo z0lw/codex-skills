@@ -1,0 +1,3 @@
+interface:
+  display_name: "DeepSeek Harness Worker"
+  short_description: "DeepSeek Harnessのセッションへ作業を指示し、結果を回収する"
